@@ -1,17 +1,3 @@
-# Copyright 2023 The JAX Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Custom masked attention for sequential recommendation models.
 
 This module implements a custom masked multi-head attention kernel where:
@@ -130,20 +116,10 @@ def custom_masked_attention_forward_kernel(
       qk_scale *= sm_scale
     qk *= qk_scale
 
-    # Apply custom mask for this Q-K block pair
-    span_q = start_q * block_q + jnp.arange(block_q)
-    span_k = start_k * block_k + jnp.arange(block_k)
-
-    # Custom mask logic:
-    # - History queries (span_q < history_len) attend to history keys (span_k < history_len)
-    # - Candidate queries (span_q >= history_len) attend to history keys (span_k < history_len)
-    # The condition simplifies to: mask is True when span_k < history_len
-    # (since we already limited upper_bound to history K blocks)
-    mask = (span_q[:, None] < history_len) & (span_k[None, :] < history_len) | \
-           (span_q[:, None] >= history_len) & (span_k[None, :] < history_len)
-
-    # Apply mask to scores
-    qk = jnp.where(mask, qk, DEFAULT_MASK_VALUE)
+    idx_k = start_k * block_k + jnp.arange(block_k)
+    mask_k = idx_k < history_len
+    
+    qk = jnp.where(mask_k[None, :], qk, DEFAULT_MASK_VALUE)
 
     # Online softmax update (FlashAttention algorithm)
     m_curr = jnp.max(qk, axis=-1)  # Current block max

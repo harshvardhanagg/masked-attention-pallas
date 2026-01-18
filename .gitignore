@@ -135,7 +135,6 @@ logs/
 *.jpg
 *.jpeg
 *.svg
-*.pdf
 !figures/*.png
 !figures/*.jpg
 !figures/*.svg
