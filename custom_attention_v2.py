@@ -216,7 +216,7 @@ def custom_masked_mha_v2(
     sm_scale: float = 1.0,
     block_sizes: BlockSizes | None = None,
     num_warps: int | None = None,
-    num_stages: int = 2,
+    num_stages: int = 3,
     grid: tuple[int, ...] | None = None,
     interpret: bool = False,
     debug: bool = False,
