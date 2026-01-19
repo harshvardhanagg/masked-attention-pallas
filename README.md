@@ -32,7 +32,7 @@ For example, with `block_k=128`:
 We can load kv blocks once and use it across multiple query block. Having two blocks per program helps to optimize it further slightly.
 
 Here's the plot that shows the comparison between the custom attention and bidirectional attention. As expected the execution time increases as history length is increased.
-<img width="906" height="319" alt="Screenshot 2026-01-18 at 10 10 58 PM" src="https://github.com/user-attachments/assets/55c5c8df-c75f-495c-b2ba-910f58380717" />
+<img width="1265" height="445" alt="Screenshot 2026-01-18 at 10 22 41 PM" src="https://github.com/user-attachments/assets/a7f68c6b-fb1c-4136-900f-3a2dbc1160be" />
 
 The benchmarking is done on B200 GPU.
 
