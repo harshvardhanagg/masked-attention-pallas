@@ -48,90 +48,148 @@ def custom_masked_attention_forward_kernel(
     q_ref, k_ref, v_ref, o_ref, *residual_refs,
     history_len: int, sm_scale: float, block_q: int, block_k: int, head_dim: int,
 ):
-  q_rows = q_ref.shape[0]
+  """
+  Forward kernel for structured masked attention:
+  - History tokens attend to history (this kernel only iterates over history KV).
+  - Candidate tokens attend only to history KV.
+
+  This version is optimized for H100 + head_dim=64 and supports "q_tile" that may
+  contain multiple Q blocks per program. It avoids the big slowdown you saw by:
+    - NOT materializing [q_tile, block_k] softmax probs for a large q_tile at once
+    - Splitting q_tile into sub-blocks of size block_q and reusing each loaded KV block
+      across those sub-blocks (the correct "KV outer" pattern).
+    - Only masking the last KV block when history_len % block_k != 0.
+    - Unrolling the <=4 KV blocks (since history_len is static and block_k=128).
+  """
+  q_rows = q_ref.shape[0]              # may be block_q, 2*block_q, 4*block_q, ...
   head_dim_padded = q_ref.shape[-1]
   head_mask = (jnp.arange(head_dim_padded) < head_dim)[None, :]
-
-  # Load Q block (q_ref is already the block via BlockSpec)
-  q = plgpu.load(q_ref, mask=head_mask, other=0.0)
-
-  # Online softmax accumulators
-  m_i = jnp.full((q_rows,), -jnp.inf, dtype=jnp.float32)
-  l_i = jnp.zeros((q_rows,), dtype=jnp.float32)
-  o   = jnp.zeros((q_rows, head_dim_padded), dtype=jnp.float32)
 
   # Scale (base-2 exp path)
   qk_scale = math.log2(math.e)
   if sm_scale != 1.0:
     qk_scale *= sm_scale
 
-  upper_bound = pl.cdiv(history_len, block_k)  # 1..4 for your case
+  # How many KV blocks in the history prefix (with your settings block_k=128 => 1..4)
+  upper_bound = pl.cdiv(history_len, block_k)
   aligned = (history_len % block_k == 0)
   valid_last = history_len - (upper_bound - 1) * block_k  # 1..block_k
 
+  # Number of Q sub-blocks inside this program
+  if q_rows % block_q != 0:
+    raise ValueError(f"Kernel expects q_rows multiple of block_q, got {q_rows=} {block_q=}")
+  q_subblocks = q_rows // block_q
+
+  # Per-subblock online-softmax state
+  m = [jnp.full((block_q,), -jnp.inf, dtype=jnp.float32) for _ in range(q_subblocks)]
+  l = [jnp.zeros((block_q,), dtype=jnp.float32) for _ in range(q_subblocks)]
+  o = [jnp.zeros((block_q, head_dim_padded), dtype=jnp.float32) for _ in range(q_subblocks)]
+
+  # Load Q sub-blocks (keep them separate to limit temporary sizes)
+  q_blocks = []
+  for sb in range(q_subblocks):
+    q_slice = pl.dslice(sb * block_q, block_q)
+    q_blk = plgpu.load(q_ref.at[q_slice, :], mask=head_mask, other=0.0)
+    q_blocks.append(q_blk)
+
   def load_kv(b: int):
     sl = pl.dslice(b * block_k, block_k)
-    k = plgpu.load(k_ref.at[sl, :], mask=head_mask, other=0.0)
-    v = plgpu.load(v_ref.at[sl, :], mask=head_mask, other=0.0)
-    return k, v
+    k_blk = plgpu.load(k_ref.at[sl, :], mask=head_mask, other=0.0)
+    v_blk = plgpu.load(v_ref.at[sl, :], mask=head_mask, other=0.0)
+    return k_blk, v_blk
 
-  # Load prefix blocks ONCE
-  # k0, v0 = load_kv(0)
-  # if upper_bound >= 2: k1, v1 = load_kv(1)
-  # if upper_bound >= 3: k2, v2 = load_kv(2)
-  # if upper_bound >= 4: k3, v3 = load_kv(3)
-
-  def update(o_prev, m_prev, l_prev, b, is_last: bool):
-    k_blk, v_blk = load_kv(b)
+  def update(q_blk, o_prev, m_prev, l_prev, k_blk, v_blk, is_last: bool):
     # QK^T
-    qk = pl.dot(q, k_blk.T).astype(jnp.float32) * qk_scale  # [block_q, block_k]
+    qk = pl.dot(q_blk, k_blk.T).astype(jnp.float32) * qk_scale  # [block_q, block_k]
 
-    # Only the final block may be partial
+    # Only the final block may be partial (avoid per-iter mask)
     if (not aligned) and is_last:
       mask_k = jnp.arange(block_k) < valid_last
       qk = jnp.where(mask_k[None, :], qk, DEFAULT_MASK_VALUE)
 
-    # Online softmax update (FlashAttention)
-    m_curr = jnp.max(qk, axis=-1)
-    m_next = jnp.maximum(m_prev, m_curr)
+    # Online softmax (FlashAttention)
+    m_curr = jnp.max(qk, axis=-1)                # [block_q]
+    m_next = jnp.maximum(m_prev, m_curr)         # [block_q]
 
-    correction = jnp.exp2(m_prev - m_next)        # [block_q]
-    l_prev_corr = l_prev * correction             # [block_q]
+    correction = jnp.exp2(m_prev - m_next)       # [block_q]
+    l_prev_corr = l_prev * correction            # [block_q]
 
-    s_curr = jnp.exp2(qk - m_next[:, None])       # [block_q, block_k]
-    l_curr = jnp.sum(s_curr, axis=-1)             # [block_q]
-    l_next = l_prev_corr + l_curr                 # [block_q]
+    s = jnp.exp2(qk - m_next[:, None])           # [block_q, block_k]
+    l_curr = jnp.sum(s, axis=-1)                 # [block_q]
+    l_next = l_prev_corr + l_curr                # [block_q]
 
-    o_prev_corr = o_prev * correction[:, None]    # [block_q, d]
-    o_curr = pl.dot(s_curr.astype(v_blk.dtype), v_blk).astype(jnp.float32)
+    o_prev_corr = o_prev * correction[:, None]   # [block_q, d]
+    # Cast probs to V dtype for tensorcore-friendly PV
+    o_curr = pl.dot(s.astype(v_blk.dtype), v_blk).astype(jnp.float32)
 
     o_next = o_prev_corr + o_curr
     return o_next, m_next, l_next
 
-  # Unroll the <=4 KV blocks and USE the cached k/v
+  # Step over one KV block: load once, update all Q sub-blocks (reuse!)
+  def kv_step(b: int, is_last: bool):
+    k_blk, v_blk = load_kv(b)
+    for sb in range(q_subblocks):
+      o[sb], m[sb], l[sb] = update(q_blocks[sb], o[sb], m[sb], l[sb], k_blk, v_blk, is_last=is_last)
+
+  # Unroll <=4 KV blocks (history_len is static in your jit)
   if upper_bound == 1:
-    o, m_i, l_i = update(o, m_i, l_i, 0, is_last=True)
+    kv_step(0, True)
   elif upper_bound == 2:
-    o, m_i, l_i = update(o, m_i, l_i, 0, is_last=False)
-    o, m_i, l_i = update(o, m_i, l_i, 1, is_last=True)
+    kv_step(0, False)
+    kv_step(1, True)
   elif upper_bound == 3:
-    o, m_i, l_i = update(o, m_i, l_i, 0, is_last=False)
-    o, m_i, l_i = update(o, m_i, l_i, 1, is_last=False)
-    o, m_i, l_i = update(o, m_i, l_i, 2, is_last=True)
-  else:  # upper_bound == 4
-    o, m_i, l_i = update(o, m_i, l_i, 0, is_last=False)
-    o, m_i, l_i = update(o, m_i, l_i, 1, is_last=False)
-    o, m_i, l_i = update(o, m_i, l_i, 2, is_last=False)
-    o, m_i, l_i = update(o, m_i, l_i, 3, is_last=True)
+    kv_step(0, False)
+    kv_step(1, False)
+    kv_step(2, True)
+  elif upper_bound == 4:
+    kv_step(0, False)
+    kv_step(1, False)
+    kv_step(2, False)
+    kv_step(3, True)
+  elif upper_bound == 5:
+    kv_step(0, False)
+    kv_step(1, False)
+    kv_step(2, False)
+    kv_step(3, False)
+    kv_step(4, True)
+  elif upper_bound == 6:
+    kv_step(0, False)
+    kv_step(1, False)
+    kv_step(2, False)
+    kv_step(3, False)
+    kv_step(4, False)
+    kv_step(5, True)
+  elif upper_bound == 7:
+    kv_step(0, False)
+    kv_step(1, False)
+    kv_step(2, False)
+    kv_step(3, False)
+    kv_step(4, False)
+    kv_step(5, False)
+    kv_step(6, True)
+  else:
+    kv_step(0, False)
+    kv_step(1, False)
+    kv_step(2, False)
+    kv_step(3, False)
+    kv_step(4, False)
+    kv_step(5, False)
+    kv_step(6, False)
+    kv_step(7, True)
 
-  # Final normalization
-  o = o / l_i[:, None]
+  # Normalize + write out per sub-block
+  for sb in range(q_subblocks):
+    o_norm = (o[sb] / l[sb][:, None]).astype(o_ref.dtype)
+    out_slice = pl.dslice(sb * block_q, block_q)
+    plgpu.store(o_ref.at[out_slice, :], o_norm, mask=head_mask)
 
+  # Optional residual LSE for backward: shape matches q_rows
   if residual_refs:
     lse_ref = residual_refs[0]
-    lse_ref[...] = m_i + jnp.log2(l_i)
+    # Concatenate in order (block_q chunks)
+    lse = jnp.concatenate([m[sb] + jnp.log2(l[sb]) for sb in range(q_subblocks)], axis=0)
+    lse_ref[...] = lse
 
-  plgpu.store(o_ref, o.astype(o_ref.dtype), mask=head_mask)
 
 
 @functools.partial(
@@ -232,7 +290,7 @@ def custom_masked_mha_v2(
   if kv_seq_len % block_k != 0:
     raise ValueError(f"{kv_seq_len=} must be a multiple of {block_k=}")
   
-  q_blocks_per_program = 1
+  q_blocks_per_program = 2
   q_tile = block_q * q_blocks_per_program
 
   # Grid computation: one program per Q block, per batch, per head
@@ -243,7 +301,7 @@ def custom_masked_mha_v2(
   # Heuristic for number of warps
   num_warps_ = num_warps
   if num_warps_ is None:
-    num_warps_ = 4 if head_dim <= 64 else 8
+    num_warps_ = 8 if head_dim <= 64 else 8
 
   kernel = functools.partial(
       custom_masked_attention_forward_kernel,
