@@ -78,7 +78,6 @@ def custom_masked_attention_forward_kernel(
     block_k: Block size for K/V dimension
     head_dim: Actual head dimension (before padding)
   """
-  seq_len = k_ref.shape[0]
   start_q = pl.program_id(0)
   head_dim_padded = q_ref.shape[-1]
 
@@ -90,7 +89,6 @@ def custom_masked_attention_forward_kernel(
   o = jnp.zeros((block_q, head_dim_padded), dtype=jnp.float32)
 
   # Load Q block: it will stay in L1/SRAM throughout
-  curr_q_slice = pl.dslice(start_q * block_q, block_q)
   head_mask = (jnp.arange(head_dim_padded) < head_dim)[None, :]
   q = plgpu.load(q_ref, mask=head_mask, other=0.0)
 
@@ -148,7 +146,7 @@ def custom_masked_attention_forward_kernel(
     lse_ref[...] = m_i + jnp.log2(l_i)
 
   # Write output to HBM
-  plgpu.store(o_ref.at[:, : o.shape[-1]], o.astype(o_ref.dtype), mask=head_mask)
+  plgpu.store(o_ref, o.astype(o_ref.dtype), mask=head_mask)
 
 
 @functools.partial(
@@ -252,7 +250,7 @@ def custom_masked_mha(
   # Grid computation: one program per Q block, per batch, per head
   grid_ = grid
   if grid_ is None:
-    grid_ = (pl.cdiv(q_seq_len, block_q), batch_size, num_heads)
+    grid_ = (pl.cdiv(candidate_len, block_q), batch_size, num_heads)
 
   # Heuristic for number of warps
   num_warps_ = num_warps
