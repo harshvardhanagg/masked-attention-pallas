@@ -45,107 +45,92 @@ class BlockSizes:
 
 
 def custom_masked_attention_forward_kernel(
-    q_ref,
-    k_ref,
-    v_ref,  # Input arrays
-    o_ref: Any,  # Output
-    *residual_refs: Any,  # Residual outputs
-    history_len: int,
-    sm_scale: float,
-    block_q: int,
-    block_k: int,
-    head_dim: int,
+    q_ref, k_ref, v_ref, o_ref, *residual_refs,
+    history_len: int, sm_scale: float, block_q: int, block_k: int, head_dim: int,
 ):
-  """
-  Custom masked attention kernel for recommendation models.
-
-  This kernel implements a structured mask where:
-  - History tokens (positions < history_len) attend bidirectionally to all history
-  - Candidate tokens (positions >= history_len) attend only to history tokens
-
-  The implementation follows the FlashAttention algorithm with online softmax
-  computation, adapted from the JAX Pallas reference implementation.
-
-  Args:
-    q_ref: Query tensor reference [seq_len, head_dim_padded]
-    k_ref: Key tensor reference [seq_len, head_dim_padded]
-    v_ref: Value tensor reference [seq_len, head_dim_padded]
-    o_ref: Output tensor reference [seq_len, head_dim_padded]
-    residual_refs: Optional residual outputs (e.g., LSE for backward pass)
-    history_len: Number of history tokens that attend bidirectionally
-    sm_scale: Softmax scale factor (typically 1/sqrt(head_dim))
-    block_q: Block size for Q dimension
-    block_k: Block size for K/V dimension
-    head_dim: Actual head dimension (before padding)
-  """
-  start_q = pl.program_id(0)
+  q_rows = q_ref.shape[0]
   head_dim_padded = q_ref.shape[-1]
-
-  # Online softmax accumulators (FlashAttention algorithm)
-  # m_i tracks the running maximum, l_i tracks the running sum
-  m_i = jnp.zeros(block_q, dtype=jnp.float32) - float('inf')
-  l_i = jnp.zeros(block_q, dtype=jnp.float32)
-  # Accumulator for output
-  o = jnp.zeros((block_q, head_dim_padded), dtype=jnp.float32)
-
-  # Load Q block: it will stay in L1/SRAM throughout
   head_mask = (jnp.arange(head_dim_padded) < head_dim)[None, :]
+
+  # Load Q block (q_ref is already the block via BlockSpec)
   q = plgpu.load(q_ref, mask=head_mask, other=0.0)
 
-  # Determine K/V iteration bounds based on custom mask structure
-  # Key optimization: Both history and candidate queries only need to attend
-  # to history K/V blocks. We skip all K/V blocks beyond history_len.
-  upper_bound = pl.cdiv(history_len, block_k)
+  # Online softmax accumulators
+  m_i = jnp.full((q_rows,), -jnp.inf, dtype=jnp.float32)
+  l_i = jnp.zeros((q_rows,), dtype=jnp.float32)
+  o   = jnp.zeros((q_rows, head_dim_padded), dtype=jnp.float32)
 
-  def body(start_k, carry):
-    """Process one K/V block and update accumulators."""
-    o_prev, m_prev, l_prev = carry
-    curr_k_slice = pl.dslice(start_k * block_k, block_k)
+  # Scale (base-2 exp path)
+  qk_scale = math.log2(math.e)
+  if sm_scale != 1.0:
+    qk_scale *= sm_scale
 
-    # Load K and V blocks
-    k = plgpu.load(k_ref.at[curr_k_slice, :], mask=head_mask, other=0.0)
-    qk = pl.dot(q, k.T)  # [block_q, block_k]
+  upper_bound = pl.cdiv(history_len, block_k)  # 1..4 for your case
+  aligned = (history_len % block_k == 0)
+  valid_last = history_len - (upper_bound - 1) * block_k  # 1..block_k
 
-    # Scale logits to convert from base-2 to natural log domain
-    # This is based on the identity: e^x = 2^(x * log2(e))
-    # Using base-2 is more hardware-friendly on GPUs
-    qk_scale = math.log2(math.e)
-    if sm_scale != 1.:
-      qk_scale *= sm_scale
-    qk *= qk_scale
+  def load_kv(b: int):
+    sl = pl.dslice(b * block_k, block_k)
+    k = plgpu.load(k_ref.at[sl, :], mask=head_mask, other=0.0)
+    v = plgpu.load(v_ref.at[sl, :], mask=head_mask, other=0.0)
+    return k, v
 
-    idx_k = start_k * block_k + jnp.arange(block_k)
-    mask_k = idx_k < history_len
-    
-    qk = jnp.where(mask_k[None, :], qk, DEFAULT_MASK_VALUE)
+  # Load prefix blocks ONCE
+  # k0, v0 = load_kv(0)
+  # if upper_bound >= 2: k1, v1 = load_kv(1)
+  # if upper_bound >= 3: k2, v2 = load_kv(2)
+  # if upper_bound >= 4: k3, v3 = load_kv(3)
 
-    # Online softmax update (FlashAttention algorithm)
-    m_curr = jnp.max(qk, axis=-1)  # Current block max
-    m_next = jnp.maximum(m_prev, m_curr)  # Global running max
-    correction = jnp.exp2(m_prev - m_next)  # Correction factor for previous values
-    l_prev_corr = correction * l_prev
-    s_curr = jnp.exp2(qk - m_next[:, None])  # Softmax of current block
-    l_curr = s_curr.sum(axis=-1)
-    l_next = l_prev_corr + l_curr
-    o_prev_corr = correction[:, None] * o_prev
-    v = plgpu.load(v_ref.at[curr_k_slice, :], mask=head_mask)
-    o_curr = pl.dot(s_curr.astype(v.dtype), v)
+  def update(o_prev, m_prev, l_prev, b, is_last: bool):
+    k_blk, v_blk = load_kv(b)
+    # QK^T
+    qk = pl.dot(q, k_blk.T).astype(jnp.float32) * qk_scale  # [block_q, block_k]
+
+    # Only the final block may be partial
+    if (not aligned) and is_last:
+      mask_k = jnp.arange(block_k) < valid_last
+      qk = jnp.where(mask_k[None, :], qk, DEFAULT_MASK_VALUE)
+
+    # Online softmax update (FlashAttention)
+    m_curr = jnp.max(qk, axis=-1)
+    m_next = jnp.maximum(m_prev, m_curr)
+
+    correction = jnp.exp2(m_prev - m_next)        # [block_q]
+    l_prev_corr = l_prev * correction             # [block_q]
+
+    s_curr = jnp.exp2(qk - m_next[:, None])       # [block_q, block_k]
+    l_curr = jnp.sum(s_curr, axis=-1)             # [block_q]
+    l_next = l_prev_corr + l_curr                 # [block_q]
+
+    o_prev_corr = o_prev * correction[:, None]    # [block_q, d]
+    o_curr = pl.dot(s_curr.astype(v_blk.dtype), v_blk).astype(jnp.float32)
 
     o_next = o_prev_corr + o_curr
     return o_next, m_next, l_next
 
-  # Process all history K/V blocks
-  o, m_i, l_i = lax.fori_loop(0, upper_bound, body, (o, m_i, l_i))
+  # Unroll the <=4 KV blocks and USE the cached k/v
+  if upper_bound == 1:
+    o, m_i, l_i = update(o, m_i, l_i, 0, is_last=True)
+  elif upper_bound == 2:
+    o, m_i, l_i = update(o, m_i, l_i, 0, is_last=False)
+    o, m_i, l_i = update(o, m_i, l_i, 1, is_last=True)
+  elif upper_bound == 3:
+    o, m_i, l_i = update(o, m_i, l_i, 0, is_last=False)
+    o, m_i, l_i = update(o, m_i, l_i, 1, is_last=False)
+    o, m_i, l_i = update(o, m_i, l_i, 2, is_last=True)
+  else:  # upper_bound == 4
+    o, m_i, l_i = update(o, m_i, l_i, 0, is_last=False)
+    o, m_i, l_i = update(o, m_i, l_i, 1, is_last=False)
+    o, m_i, l_i = update(o, m_i, l_i, 2, is_last=False)
+    o, m_i, l_i = update(o, m_i, l_i, 3, is_last=True)
 
-  # Final normalization (divide by sum of weights)
-  o /= l_i[:, None]
+  # Final normalization
+  o = o / l_i[:, None]
 
-  # Store LSE (log-sum-exp) for potential backward pass
   if residual_refs:
     lse_ref = residual_refs[0]
     lse_ref[...] = m_i + jnp.log2(l_i)
 
-  # Write output to HBM
   plgpu.store(o_ref, o.astype(o_ref.dtype), mask=head_mask)
 
 
@@ -164,7 +149,7 @@ def custom_masked_attention_forward_kernel(
         "return_residuals",
     ],
 )
-def custom_masked_mha(
+def custom_masked_mha_v2(
     q,
     k,
     v,
@@ -246,11 +231,14 @@ def custom_masked_mha(
     raise ValueError(f"{q_seq_len=} must be a multiple of {block_q=}")
   if kv_seq_len % block_k != 0:
     raise ValueError(f"{kv_seq_len=} must be a multiple of {block_k=}")
+  
+  q_blocks_per_program = 1
+  q_tile = block_q * q_blocks_per_program
 
   # Grid computation: one program per Q block, per batch, per head
   grid_ = grid
   if grid_ is None:
-    grid_ = (pl.cdiv(q_seq_len, block_q), batch_size, num_heads)
+    grid_ = (pl.cdiv(q_seq_len, q_tile), batch_size, num_heads)
 
   # Heuristic for number of warps
   num_warps_ = num_warps
@@ -269,7 +257,7 @@ def custom_masked_mha(
   # BlockSpec defines how data is tiled and distributed across the grid
   in_specs = [
       # Q: each program processes one Q block
-      pl.BlockSpec((None, block_q, None, head_dim_padded),
+      pl.BlockSpec((None, q_tile, None, head_dim_padded),
                    lambda i, j, k: (j, i, k, 0)),
       # K: full sequence available to all programs
       pl.BlockSpec((None, kv_seq_len, None, head_dim_padded),
@@ -281,7 +269,7 @@ def custom_masked_mha(
 
   out_shape = [q]
   out_specs = [
-      pl.BlockSpec((None, block_q, None, head_dim_padded),
+      pl.BlockSpec((None, q_tile, None, head_dim_padded),
                    lambda i, j, k: (j, i, k, 0))
   ]
 
@@ -293,7 +281,7 @@ def custom_masked_mha(
         )
     )
     out_specs.append(
-        pl.BlockSpec((None, None, block_q), lambda i, j, k: (j, k, i))
+        pl.BlockSpec((None, None, q_tile), lambda i, j, k: (j, k, i))
     )
 
   out = pl.pallas_call(
